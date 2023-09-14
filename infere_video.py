@@ -22,6 +22,7 @@ import torch
 from torchvision import transforms, datasets
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 
 import open3d as o3d
 
@@ -36,17 +37,17 @@ def visualize_pointcloud(viewer, image, depth, calib):
 
     pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, camera_intrinsic)
     
-    R = pcd.get_rotation_matrix_from_xyz((np.pi / 2, np.pi, 0))
-    pcd.rotate(R, center=(0, 0, 0))
-    pcd.translate((0, 0, -3))
+    # R = pcd.get_rotation_matrix_from_xyz((np.pi / 2, np.pi, 0))
+    # pcd.rotate(R, center=(0, 0, 0))
+    # pcd.translate((0, 0, -3))
 
     o3d.io.write_point_cloud('PointCloud.pcd', pcd)
     
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=0.05)
+    # voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=0.05)
 
     # viewer.update_geometry(pcd)
     viewer.clear_geometries()
-    viewer.add_geometry(voxel_grid)
+    viewer.add_geometry(pcd)
     viewer.poll_events()
     viewer.update_renderer()
 
@@ -172,6 +173,8 @@ def test_simple(
     
     points_without_depth = torch.tensordot(torch.tensor(K_inv).to(device), pixel_coord, ([1], [0]))
 
+    prev_hist2d = None
+
     # PREDICTING ON EACH IMAGE IN TURN
     with torch.no_grad():
         while success:
@@ -188,7 +191,6 @@ def test_simple(
             pred_depth = 0.5 * pred_depth
             pred_depth += 0.2
             pred_depth[pred_depth > 15] = 15
-            
 
             if show_plot:
                 points_3d = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
@@ -222,15 +224,71 @@ def test_simple(
                     depth_plot.set_data(pred_depth)
 
                 axs[1, 1].clear()
-                axs[1, 1].hist2d(
+                # hist2d_out = axs[1, 1].hist2d(
+                #     scatter_map2d[:, 0], 
+                #     scatter_map2d[:, 1], 
+                #     bins=128, 
+                #     range=[[-1.5, 1.5], [0, 3]], 
+                #     density=True,
+                #     cmin=5,
+                #     cmax=None,
+                #     cmap='viridis')
+
+                hist_2d = np.histogram2d(
                     scatter_map2d[:, 0], 
                     scatter_map2d[:, 1], 
                     bins=128, 
                     range=[[-1.5, 1.5], [0, 3]], 
-                    density=False,
-                    cmin=100,
-                    cmax=None,
-                    cmap='viridis')
+                    density=True)
+                
+                hist_2d = np.moveaxis(hist_2d[0], 0, 1)
+                hist_2d = np.flip(hist_2d, 0)
+                hist_2d[np.isnan(hist_2d)] = 0
+
+                if prev_hist2d is not None:
+                    # Translate previous hist2d
+                    bin_in_meters = 3 / 128
+                    translation = int(0.3 / bin_in_meters)
+
+                    prev_hist2d_translated = np.zeros((128, 128))
+                    prev_hist2d_translated[translation:,:] = prev_hist2d[:(128 - translation), :]
+
+                    hist_2d = 0.9 * hist_2d + 0.1 * prev_hist2d_translated
+                    prev_hist2d = hist_2d
+
+                else:
+                    prev_hist2d = hist_2d
+
+                hist_2d[hist_2d < 5] = 0
+
+                axs[1, 1].imshow(hist_2d, interpolation=None, extent=[-1.5, 1.5, 0, 3])
+
+                if (hist_2d > 0).any():
+                    closest = 0
+                    furthest = hist_2d.shape[0] - 1
+                    leftmost = 0
+                    rightmost = hist_2d.shape[1] - 1
+
+                    while (hist_2d[closest] == 0).all():
+                        closest += 1
+                    while (hist_2d[furthest] == 0).all():
+                        furthest -= 1
+                    while (hist_2d[:, leftmost] == 0).all():
+                        leftmost += 1
+                    while (hist_2d[:, rightmost] == 0).all():
+                        rightmost -= 1
+
+                    leftmost = leftmost * 3 / hist_2d.shape[0] - 1.5
+                    rightmost = rightmost * 3 / hist_2d.shape[0] - 1.5
+                    furthest = 3 - furthest * 3 / hist_2d.shape[0]
+                    closest = 3 - closest * 3 / hist_2d.shape[0]
+
+                    rect = patches.Rectangle((leftmost, closest), rightmost - leftmost, furthest - closest, linewidth=1, edgecolor='r', facecolor='none')
+                    axs[1, 1].add_patch(rect)
+                    print('Found bounding box is ({}, {}), ({}, {})'.format(leftmost, furthest, rightmost, closest))
+                
+                else:
+                    print('No obstacle found')
                 # axs[2].set_ylim([0, 3])
                 # axs[2].set_xlim([-3, 3])
 
@@ -246,7 +304,7 @@ def test_simple(
     print('-> Done!')
 
 if __name__ == '__main__':
-    test_simple('dpt_levit_224', 'weights/dpt_levit_224.pt', 'input/left_1.avi')
+    test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_1.avi')
     # test_simple('RA-Depth', 'assets/left_1.avi')
     # test_simple('RA-Depth', 'assets/left_2.avi')
     # test_simple('RA-Depth', 'assets/left_3.avi')
