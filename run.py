@@ -10,8 +10,10 @@ import time
 
 import numpy as np
 
-from imutils.video import VideoStream
+# from imutils.video import VideoStream
+import cv2
 from midas.model_loader import default_models, load_model
+import matplotlib.pyplot as plt
 
 first_execution = True
 def process(device, model, model_type, image, input_size, target_size, optimize, use_camera):
@@ -170,21 +172,41 @@ def run(input_path, output_path, model_path, model_type="dpt_beit_large_512", op
     else:
         with torch.no_grad():
             fps = 1
-            video = VideoStream(0).start()
+            video = cv2.VideoCapture('input/left_1.avi')
             time_start = time.time()
             frame_index = 0
-            while True:
-                frame = video.read()
+            success = True
+
+            fig, axs = plt.subplots(2)
+
+            while success:
+                success, frame = video.read()
                 if frame is not None:
                     original_image_rgb = np.flip(frame, 2)  # in [0, 255] (flip required to get RGB)
                     image = transform({"image": original_image_rgb/255})["image"]
 
                     prediction = process(device, model, model_type, image, (net_w, net_h),
                                          original_image_rgb.shape[1::-1], optimize, True)
+                    
+                    depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
+                    depth = 1. / (depth + 1e-5)
+                    depth = 0.5 * depth
+                    depth += 0.2
+                    depth[depth > 15] = 15
+
+                    mask = depth < 3
+                    image_masked = original_image_rgb
+                    image_masked[:,:,0] *= mask
+                    image_masked[:,:,1] *= mask
+                    image_masked[:,:,2] *= mask
+
+                    axs[0].imshow(depth)
+                    axs[1].imshow(image_masked)
+                    plt.pause(0.1)
 
                     original_image_bgr = np.flip(original_image_rgb, 2) if side else None
                     content = create_side_by_side(original_image_bgr, prediction, grayscale)
-                    cv2.imshow('MiDaS Depth Estimation - Press Escape to close window ', content/255)
+                    # cv2.imshow('MiDaS Depth Estimation - Press Escape to close window ', content/255)
 
                     if output_path is not None:
                         filename = os.path.join(output_path, 'Camera' + '-' + model_type + '_' + str(frame_index))
@@ -196,8 +218,8 @@ def run(input_path, output_path, model_path, model_type="dpt_beit_large_512", op
                         time_start = time.time()
                     print(f"\rFPS: {round(fps,2)}", end="")
 
-                    if cv2.waitKey(1) == 27:  # Escape key
-                        break
+                    # if cv2.waitKey(1) == 27:  # Escape key
+                    #     break
 
                     frame_index += 1
         print()

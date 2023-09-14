@@ -108,3 +108,6 @@ venv.bak/
 *.jpg
 *.jpeg
 *.pt
+*.avi
+*.mp4
+.vscode
