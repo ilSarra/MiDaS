@@ -188,7 +188,7 @@ def test_simple(
             
             pred_depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
             pred_depth = 1. / (pred_depth + 1e-5)
-            pred_depth = 0.5 * pred_depth
+            pred_depth = 0.6 * pred_depth
             pred_depth += 0.2
             pred_depth[pred_depth > 15] = 15
 
