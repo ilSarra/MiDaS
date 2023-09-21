@@ -17,9 +17,12 @@ import matplotlib.cm as cm
 import cv2
 
 from midas.model_loader import default_models, load_model
+from segmentation.models.unet.unet import unet_model
+from segmentation.segmentation_utils import preprocess as seg_preprocess, classify as seg_classify
 
 import torch
 from torchvision import transforms, datasets
+import tensorflow as tf
 
 from scipy.optimize import minimize
 from scipy.linalg import svd
@@ -72,7 +75,7 @@ def estimate_scale_svd(points, h):
     normal /= np.linalg.norm(normal)
 
     b = normal[0] * centroid[0] + normal[1] * centroid[1] + normal[2] * centroid[2]
-    scale = h / b
+    scale = b / h
 
     show = False
 
@@ -210,8 +213,8 @@ def test_simple(
     K[1, 2] = 239.5
 
     # LOADING PRETRAINED MODEL
-    model, transform, feed_width, feed_height = load_model(device, model_path, model_type, False)
-
+    depth_model, transform, feed_width, feed_height = load_model(device, model_path, model_type, False)
+    seg_model = tf.keras.models.load_model('saved_models/deeplabv3plus_1678715796687275')
 
     # LOAD VIDEO STREAM
     video_stream = cv2.VideoCapture(video_path)
@@ -261,16 +264,19 @@ def test_simple(
             image = transform({"image": original_image_rgb/255})["image"]
 
             # PREDICTION
-            prediction = process(device, model, model_type, image, (feed_width, feed_height),
+            disp = process(device, depth_model, model_type, image, (feed_width, feed_height),
                                     original_image_rgb.shape[1::-1], False, True)
             
-            pred_depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
-            pred_depth = 1. / (pred_depth + 1e-5)
+            segmentation = seg_model.predict(seg_preprocess(frame, seg_model.input_shape))
+            grass_mask = seg_classify(segmentation)
+            
+            # pred_depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
+            # pred_depth = 1. / (pred_depth + 1e-5)
             # shifted_disparity = prediction - np.min(prediction)
             # pred_depth = 1/ (shifted_disparity + 1e-5)
-            pred_depth -= np.min(pred_depth)
-            pred_depth = 0.6 * pred_depth
-            pred_depth += 0.3
+            # pred_depth -= np.min(pred_depth)
+            # pred_depth = 0.6 * pred_depth
+            # pred_depth += 0.3
 
             # Estimated with equations
             # a = 2000
@@ -286,17 +292,21 @@ def test_simple(
 
             #########################
 
-            # max_d = 100
-            # min_d = 0.3
+            max_d = 1e4
+            min_d = 0.0
 
             # abs_disp = np.abs(prediction)
             # pred_depth = 1 / (abs_disp + 1e-5)
             # pred_depth = (pred_depth - np.min(pred_depth)) / (np.max(pred_depth) - np.min(pred_depth))
             # pred_depth = pred_depth * (max_d - min_d) + min_d
 
+            pred_depth = 1 / np.abs(disp)
+            pred_depth -= np.min(pred_depth)
+            pred_depth = pred_depth * (max_d - min_d) + min_d
+
             points_3d_raw = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
             
-            grass_mask = (points_3d_raw[1] < -0.1) * (points_3d_raw[2] < 3)
+            # grass_mask = (points_3d_raw[1] < -0.1) * (points_3d_raw[2] < 3)
             grass_points = points_3d_raw[:, grass_mask]
 
             grass_image = grass_mask.unsqueeze(-1).repeat(1, 1, 3).cpu().numpy() * original_image_rgb
