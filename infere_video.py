@@ -17,12 +17,12 @@ import matplotlib.cm as cm
 import cv2
 
 from midas.model_loader import default_models, load_model
-from segmentation.models.unet.unet import unet_model
-from segmentation.segmentation_utils import preprocess as seg_preprocess, classify as seg_classify
+from torchvision.models.segmentation.deeplabv3 import DeepLabHead
+from torchvision.models.segmentation import deeplabv3_resnet50
+from segmentation.utils import preprocess_input as seg_preprocess
 
 import torch
 from torchvision import transforms, datasets
-import tensorflow as tf
 
 from scipy.optimize import minimize
 from scipy.linalg import svd
@@ -74,7 +74,7 @@ def estimate_scale_svd(points, h):
     normal = v[2]
     normal /= np.linalg.norm(normal)
 
-    b = normal[0] * centroid[0] + normal[1] * centroid[1] + normal[2] * centroid[2]
+    b = np.dot(normal, centroid)
     scale = b / h
 
     show = False
@@ -214,7 +214,12 @@ def test_simple(
 
     # LOADING PRETRAINED MODEL
     depth_model, transform, feed_width, feed_height = load_model(device, model_path, model_type, False)
-    seg_model = tf.keras.models.load_model('saved_models/deeplabv3plus_1678715796687275')
+    seg_model = model = deeplabv3_resnet50(pretrained=True, progress=True)
+    seg_model.classifier = DeepLabHead(2048, 2)
+    seg_weights = torch.load('weights/deeplabv3_6.pt')
+    seg_model.load_state_dict(seg_weights)
+
+    seg_model.eval()
 
     # LOAD VIDEO STREAM
     video_stream = cv2.VideoCapture(video_path)
@@ -267,8 +272,9 @@ def test_simple(
             disp = process(device, depth_model, model_type, image, (feed_width, feed_height),
                                     original_image_rgb.shape[1::-1], False, True)
             
-            segmentation = seg_model.predict(seg_preprocess(frame, seg_model.input_shape))
-            grass_mask = seg_classify(segmentation)
+            seg_input = seg_preprocess(frame, [640, 480]).unsqueeze(0)
+            segmentation = seg_model(seg_input)
+            grass_mask = torch.argmin(segmentation['out'][0], 0).bool().cuda()
             
             # pred_depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
             # pred_depth = 1. / (pred_depth + 1e-5)
@@ -334,14 +340,14 @@ def test_simple(
             points_3d = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
 
             if show_plot:
-                mask = (points_3d[1] > -0.05) * (points_3d[1] < 1) * (points_3d[2] < 3)
+                mask = ~grass_mask * (points_3d[1] < 1) * (points_3d[2] < 3)
                 # mask = (points_3d[1, :, :] < 1) * (torch.abs(points_3d[2, :, :]) < 3)
                 mask_3c = mask.unsqueeze(-1).repeat(1, 1, 3)
 
                 masked_image = original_image_rgb * mask_3c.cpu().numpy()
-                masked_depth = pred_depth * mask.cpu().numpy()
+                # masked_depth = pred_depth * mask.cpu().numpy()
 
-                avg_center = torch.mean(points_3d   [2, :, 220:420])
+                # avg_center = torch.mean(points_3d   [2, :, 220:420])
                 # print("Average depth value in range 220:320", avg_center.item())
 
                 scatter_map2d = np.zeros((torch.count_nonzero(mask), 2))
