@@ -21,12 +21,89 @@ from midas.model_loader import default_models, load_model
 import torch
 from torchvision import transforms, datasets
 
+from scipy.optimize import minimize
+from scipy.linalg import svd
+
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 
 import open3d as o3d
 
+import warnings
+warnings.filterwarnings('ignore')
+
+
 first_execution = True
+
+def estimate_scale(points, h):
+    x = points[0]
+    y = points[1]
+    z = points[2]
+
+    def scale_est_cost(a):
+        # cost = np.median(np.abs(a[0] * points[0] + a[1] * points[1] + a[2] * points[2] + a[3]))
+        cost = a[0] * x + a[1] * z + a[2] - y
+        cost = np.abs(cost)
+        cost = np.median(cost)
+        return cost
+        
+    initial_a = [0, 0, -h]
+    res = minimize(scale_est_cost, initial_a, tol=1e-3)
+
+    scale = -res.x[-1] / h
+    # scale = -h / res.x[-1]
+    print(res.x)
+
+    return scale
+
+
+def estimate_scale_svd(points, h):
+    xyz = np.moveaxis(points, 0, -1)
+    np.random.shuffle(xyz)
+    xyz = xyz[:1000]
+
+    centroid = xyz.mean(axis=0)
+    # xyzT = np.transpose(xyz)
+    xyzR = xyz - centroid
+    # xyzRT = np.transpose(xyzR)
+    
+    u, sigma, v = np.linalg.svd(xyzR)
+    normal = v[2]
+    normal /= np.linalg.norm(normal)
+
+    b = normal[0] * centroid[0] + normal[1] * centroid[1] + normal[2] * centroid[2]
+    scale = h / b
+
+    show = False
+
+    if show:
+        forGraphs = list()
+        forGraphs.append(np.array([centroid[0],centroid[1],centroid[2],normal[0],normal[1], normal[2]]))
+
+        xyz = np.transpose(xyz)
+
+        # create x,y for display
+        minPlane = int(np.floor(min(min(xyz[0]), min(xyz[1]), min(xyz[2]))))
+        maxPlane = int(np.ceil(max(max(xyz[0]), max(xyz[1]), max(xyz[2]))))
+        xx, yy = np.meshgrid(range(minPlane,maxPlane), range(minPlane,maxPlane))
+
+        # calculate corresponding z for display
+        z = (-normal[0] * xx - normal[1] * yy + b) * 1. /normal[2]
+
+        #matplotlib display code
+        forGraphs = np.asarray(forGraphs)
+        X, Y, Z, U, V, W = zip(*forGraphs)
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.plot_surface(xx, yy, z, alpha=0.2)
+        ax.scatter(xyz[0],xyz[1],xyz[2])
+        ax.quiver(X, Y, Z, U, V, W)
+        ax.set_xlim([min(xyz[0])- 0.1, max(xyz[0]) + 0.1])
+        ax.set_ylim([min(xyz[1])- 0.1, max(xyz[1]) + 0.1])
+        ax.set_zlim([min(xyz[2])- 0.1, max(xyz[2]) + 0.1])   
+        plt.show() 
+
+    return np.abs(scale)
 
 def visualize_pointcloud(viewer, image, depth, calib):
     rgb_image = o3d.geometry.Image(np.ascontiguousarray(image.astype(np.uint8)))
@@ -174,11 +251,12 @@ def test_simple(
     points_without_depth = torch.tensordot(torch.tensor(K_inv).to(device), pixel_coord, ([1], [0]))
 
     prev_hist2d = None
+    scale = -1
 
     # PREDICTING ON EACH IMAGE IN TURN
     with torch.no_grad():
         while success:
-            print("-> Predicting on new frame")
+            # print("-> Predicting on new frame")
             original_image_rgb = np.flip(frame, 2)  # in [0, 255] (flip required to get RGB)
             image = transform({"image": original_image_rgb/255})["image"]
 
@@ -188,13 +266,65 @@ def test_simple(
             
             pred_depth = (prediction - np.min(prediction)) / (np.max(prediction) - np.min(prediction))
             pred_depth = 1. / (pred_depth + 1e-5)
+            # shifted_disparity = prediction - np.min(prediction)
+            # pred_depth = 1/ (shifted_disparity + 1e-5)
+            pred_depth -= np.min(pred_depth)
             pred_depth = 0.6 * pred_depth
-            pred_depth += 0.2
+            pred_depth += 0.3
+
+            # Estimated with equations
+            # a = 2000
+            # b = 0
+            # pred_depth = a * pred_depth + b
+            # pred_depth[pred_depth > 15] = 15
+            # pred_depth[pred_depth < 0] = torch.inf
+            # pred_depth[pred_depth < 0.3] = 0.3
+
+            # pred_depth -= np.min(pred_depth)
+            # pred_depth *= 10
+            # pred_depth += 0.3
+
+            #########################
+
+            # max_d = 100
+            # min_d = 0.3
+
+            # abs_disp = np.abs(prediction)
+            # pred_depth = 1 / (abs_disp + 1e-5)
+            # pred_depth = (pred_depth - np.min(pred_depth)) / (np.max(pred_depth) - np.min(pred_depth))
+            # pred_depth = pred_depth * (max_d - min_d) + min_d
+
+            points_3d_raw = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
+            
+            grass_mask = (points_3d_raw[1] < -0.1) * (points_3d_raw[2] < 3)
+            grass_points = points_3d_raw[:, grass_mask]
+
+            grass_image = grass_mask.unsqueeze(-1).repeat(1, 1, 3).cpu().numpy() * original_image_rgb
+
+            if scale < 0:
+                scale = estimate_scale_svd(grass_points.detach().cpu().numpy(), 0.2)
+
+            elif grass_points.shape[-1] > 1e3:
+                a = 0.9
+                estimated_scale = estimate_scale_svd(grass_points.detach().cpu().numpy(), 0.2)
+
+                if estimated_scale > 0:
+                    scale = a * scale + (1 - a) * estimated_scale
+
+                print("estimated scale", estimated_scale, "updated scale", scale)
+            
+
+            if scale > 0:
+                pred_depth = scale * pred_depth
+
             pred_depth[pred_depth > 15] = 15
+            pred_depth[pred_depth < 0] = 15
+
+            del points_3d_raw
+            points_3d = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
 
             if show_plot:
-                points_3d = points_without_depth * torch.tensor(pred_depth).to(device).unsqueeze(0).repeat(3, 1, 1)
-                mask = (points_3d[1, :, :] > -0.2) * (points_3d[1, :, :] < 1) * (torch.abs(points_3d[2, :, :]) < 3)
+                mask = (points_3d[1] > -0.05) * (points_3d[1] < 1) * (points_3d[2] < 3)
                 # mask = (points_3d[1, :, :] < 1) * (torch.abs(points_3d[2, :, :]) < 3)
                 mask_3c = mask.unsqueeze(-1).repeat(1, 1, 3)
 
@@ -202,21 +332,21 @@ def test_simple(
                 masked_depth = pred_depth * mask.cpu().numpy()
 
                 avg_center = torch.mean(points_3d   [2, :, 220:420])
-                print("Average depth value in range 220:320", avg_center.item())
+                # print("Average depth value in range 220:320", avg_center.item())
 
                 scatter_map2d = np.zeros((torch.count_nonzero(mask), 2))
                 scatter_map2d[:, 0] = points_3d[0, mask].cpu().numpy()
                 scatter_map2d[:, 1] = points_3d[2, mask].cpu().numpy()
 
                 if input_plot is None:
-                    input_plot = axs[0, 0].imshow(original_image_rgb)
+                    input_plot = axs[0, 0].imshow(masked_image)
                 else:
-                    input_plot.set_data(original_image_rgb)
+                    input_plot.set_data(masked_image)
 
                 if input_masked_plot is None:
-                    input_masked_plot = axs[0, 1].imshow(masked_image)
+                    input_masked_plot = axs[0, 1].imshow(grass_image)
                 else:
-                    input_masked_plot.set_data(masked_image)
+                    input_masked_plot.set_data(grass_image)
 
                 if depth_plot is None:
                     depth_plot = axs[1, 0].imshow(pred_depth)
@@ -245,19 +375,19 @@ def test_simple(
                 hist_2d = np.flip(hist_2d, 0)
                 hist_2d[np.isnan(hist_2d)] = 0
 
-                if prev_hist2d is not None:
-                    # Translate previous hist2d
-                    bin_in_meters = 3 / 128
-                    translation = int(0.3 / bin_in_meters)
+                # if prev_hist2d is not None:
+                #     # Translate previous hist2d
+                #     bin_in_meters = 3 / 128
+                #     translation = int(0.3 / bin_in_meters)
 
-                    prev_hist2d_translated = np.zeros((128, 128))
-                    prev_hist2d_translated[translation:,:] = prev_hist2d[:(128 - translation), :]
+                #     prev_hist2d_translated = np.zeros((128, 128))
+                #     prev_hist2d_translated[translation:,:] = prev_hist2d[:(128 - translation), :]
 
-                    hist_2d = 0.9 * hist_2d + 0.1 * prev_hist2d_translated
-                    prev_hist2d = hist_2d
+                #     hist_2d = 0.9 * hist_2d + 0.1 * prev_hist2d_translated
+                #     prev_hist2d = hist_2d
 
-                else:
-                    prev_hist2d = hist_2d
+                # else:
+                    # prev_hist2d = hist_2d
 
                 hist_2d[hist_2d < 5] = 0
 
@@ -285,10 +415,10 @@ def test_simple(
 
                     rect = patches.Rectangle((leftmost, closest), rightmost - leftmost, furthest - closest, linewidth=1, edgecolor='r', facecolor='none')
                     axs[1, 1].add_patch(rect)
-                    print('Found bounding box is ({}, {}), ({}, {})'.format(leftmost, furthest, rightmost, closest))
+                    # print('Found bounding box is ({}, {}), ({}, {})'.format(leftmost, furthest, rightmost, closest))
                 
-                else:
-                    print('No obstacle found')
+                # else:
+                    # print('No obstacle found')
                 # axs[2].set_ylim([0, 3])
                 # axs[2].set_xlim([-3, 3])
 
@@ -304,13 +434,12 @@ def test_simple(
     print('-> Done!')
 
 if __name__ == '__main__':
+    test_simple('midas_v21_384', 'weights/midas_v21_384.pt', 'input/left_0.avi')
     test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_1.avi')
-    # test_simple('RA-Depth', 'assets/left_1.avi')
-    # test_simple('RA-Depth', 'assets/left_2.avi')
-    # test_simple('RA-Depth', 'assets/left_3.avi')
-    # test_simple('RA-Depth', 'assets/left_4.avi')
-    # test_simple('RA-Depth', 'assets/left_5.avi')
-    # test_simple('RA-Depth', '/home/davidesarraggiotto/Deer_GroundRobot.mp4')
+    test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_2.avi')
+    test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_3.avi')
+    test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_4.avi')
+    test_simple('dpt_swin2_tiny_256', 'weights/dpt_swin2_tiny_256.pt', 'input/left_5.avi')
 
 
 #CUDA_VISIBLE_DEVICES=0 python test_simple.py --image_path /test/monodepth2-master/assets/test.png --model_name RA-Depth
